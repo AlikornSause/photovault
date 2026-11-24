@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Hide a memory from its card or page, with Undo. It stays hidden on later
+  days and next year too, and kinds of memory you keep hiding show up less.
+- Hide a person from Memories from their page.
+- "Not a face" on a face (person page and Review faces), and Undo after
+  merging two people.
+- Undo for every decision about a face: "yes", "no", "not a face", "not
+  sure" and moving a face to someone else, from Review faces (also U or
+  Ctrl+Z), the person page and "Find more like this". It puts the face back
+  exactly as it was, including earlier "not this person" decisions. (#34)
+- Search by person and thing: `@Dad @Mom #food` finds photos with both of
+  them where food is in the picture. Typing `@` lists your people; an
+  unknown name says so instead of finding nothing silently. (#35)
+- Recent searches appear when the search box is empty. (#38)
+- Smriti installed with Nix says to update through Nix instead of trying
+  to replace itself.
+
+### Changed
+- Memories show the best photos of each moment instead of everything from
+  that day: screenshots, tiny images, copies and look-alikes stay out,
+  favourites and faces lead, and the cover is the best photo.
+- Memories are ordered by what's likely to mean most (favourites, people you
+  named) rather than by size, and kinds take turns.
+- The home city set in Settings is used by memories and titles too, not only
+  by trip suggestions.
+- Gatherings, events and titles count only people you named or who turn up
+  on several days, so strangers in a crowd no longer make a "gathering".
+- Combined searches find what they should: "Dad and Mom food" looks for
+  food among photos of both of them, not only among the library's top food
+  photos, and names are no longer fed to visual search. Searches of only
+  names, places or dates no longer run visual search at all. (#35)
+- "Find more like this" shows 48 faces, three times larger, closest first
+  with how close each is; click a face to see its photo. New face crops are
+  saved at 112 px instead of 80. (#33)
+- Error messages say what failed in plain words; the technical detail shows
+  in Developer mode. Many settings, buttons and empty pages are worded more
+  plainly.
+
+### Fixed
+- Moving a face to someone else no longer leaves it counted, or in the
+  gallery, of the person it left.
+- Updated the database library (rusqlite 0.43, SQLite 3.54) and other
+  dependencies for new security advisories; dropped stale advisory
+  exceptions, and a stale one now fails the check. (#40)
+- Corrections stick:
+  - A removed person's faces are no longer regrouped into a new person.
+  - Two people whose merge was undone are never merged again.
+  - Faces skipped in review stop coming back.
+  - A dismissed trip or event no longer returns after a few months, or when
+    a photo is added to or removed from it.
+- Less nagging:
+  - "Keep for now" on the missing-photos banner is remembered until more
+    photos go missing.
+  - The People banner about faces to check can be put off.
+  - Album ideas left unanswered stop being offered after a while.
+
 ## [0.5.0] — 2026-10-19
 
 ### Added

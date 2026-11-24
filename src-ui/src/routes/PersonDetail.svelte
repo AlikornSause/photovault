@@ -6,6 +6,7 @@
   import { commandErrorMessage } from "../lib/api";
   import { people, trash, type FaceDetailDto } from "../lib/api/all";
   import { toasts } from "../lib/stores/toast.svelte";
+  import { offerFaceUndo } from "../lib/faceUndo";
   import { libraryStore } from "../lib/stores/library.svelte";
   import { browseContext } from "../lib/stores/browseContext.svelte";
   import { photoVisibility } from "../lib/stores/photoVisibility.svelte";
@@ -36,6 +37,7 @@
   let error = $state<string | null>(null);
   let showAddDialog = $state(false);
   let showMergeDialog = $state(false);
+  let hiddenFromMemories = $state(false);
   let showReassignDialog = $state<number | null>(null);
   let showKSimilarDialog = $state(false);
   let unconfirmedFaces = $state<FaceDetailDto[]>([]);
@@ -67,7 +69,7 @@
     const seq = loadSeq;
     const personId = id;
     const label = person.name ?? `Person ${person.id}`;
-    if (!confirm(`Remove ${label} as a person?\n\nFaces stay in their photos and may be re-clustered next time face detection runs.`)) return;
+    if (!confirm(`Remove ${label} as a person?\n\nTheir photos stay. Smriti won't group these faces into a person again.`)) return;
     try {
       actionBusy = true;
       await people.delete(person.id);
@@ -106,7 +108,7 @@
       const result = await trash.trashPhotos(ids, session);
       if (!mounted || seq !== loadSeq || personId !== id) return;
       if (result.count === 0) {
-        toasts.info("No selected photos needed trashing");
+        toasts.info("Those photos are already in Trash");
         return;
       }
       photoVisibility.markTrashed(ids);
@@ -284,6 +286,9 @@
       hasMore = photoPage.has_more;
       unconfirmedFaces = facePage.items;
       browseContext.set(`person:${personId}`, firstIds);
+      void people.memoriesHidden(personId).then((hidden) => {
+        if (mounted && seq === loadSeq) hiddenFromMemories = hidden;
+      }).catch(() => {});
       if (nextPerson.photo_count <= ALL_IDS_NAV_LIMIT) {
         void people.photoIds(personId).then((allIds) => {
           if (!mounted || seq !== loadSeq || personId !== id) return;
@@ -326,30 +331,46 @@
     if (remaining < 900) void loadMorePhotos();
   }
 
-  async function confirmFace(faceId: number) {
+  /// A decision on a face in "Verify these", with Undo that puts the face
+  /// back where it was.
+  async function decide(faceId: number, act: (id: number) => Promise<string>, message: string) {
     if (verifyBusy) return;
     const seq = loadSeq;
     const personId = id;
+    const index = unconfirmedFaces.findIndex((f) => f.face_id === faceId);
+    const face = unconfirmedFaces[index];
     verifyBusy = true;
     try {
-      await people.faceConfirm(faceId);
+      const token = await act(faceId);
       if (!mounted || seq !== loadSeq || personId !== id) return;
       unconfirmedFaces = unconfirmedFaces.filter((f) => f.face_id !== faceId);
+      offerFaceUndo(token, message, () => {
+        if (!mounted || seq !== loadSeq || personId !== id || !face) return;
+        const next = [...unconfirmedFaces];
+        next.splice(Math.min(index, next.length), 0, face);
+        unconfirmedFaces = next;
+      });
     } catch (e) { if (mounted && seq === loadSeq && personId === id) error = commandErrorMessage(e); }
     finally { if (mounted && seq === loadSeq && personId === id) verifyBusy = false; }
   }
 
-  async function rejectFace(faceId: number) {
-    if (verifyBusy) return;
-    const seq = loadSeq;
+  const personName = $derived(person?.name ?? "this person");
+  const confirmFace = (faceId: number) => decide(faceId, people.faceConfirm, `That's ${personName}`);
+  const rejectFace = (faceId: number) => decide(faceId, (f) => people.faceReject(f), `Not ${personName}`);
+  const ignoreFace = (faceId: number) => decide(faceId, people.faceIgnore, "Not a face");
+
+  async function toggleMemories() {
+    if (!person || actionBusy) return;
     const personId = id;
-    verifyBusy = true;
+    const hide = !hiddenFromMemories;
+    actionBusy = true;
     try {
-      await people.faceReject(faceId);
-      if (!mounted || seq !== loadSeq || personId !== id) return;
-      unconfirmedFaces = unconfirmedFaces.filter((f) => f.face_id !== faceId);
-    } catch (e) { if (mounted && seq === loadSeq && personId === id) error = commandErrorMessage(e); }
-    finally { if (mounted && seq === loadSeq && personId === id) verifyBusy = false; }
+      const now = await people.memoriesHidden(personId, hide);
+      if (!mounted || personId !== id) return;
+      hiddenFromMemories = now;
+      toasts.info(now ? "Got it. They won't appear in Memories" : "They'll appear in Memories again");
+    } catch (e) { if (mounted && personId === id) error = commandErrorMessage(e); }
+    finally { if (mounted) actionBusy = false; }
   }
 
   async function reassignFace(faceId: number) {
@@ -417,6 +438,9 @@
             <Search size={14} strokeWidth={1.75} />
             Find more like this
           </button>
+          <button class="ghost" onclick={toggleMemories} disabled={actionBusy}>
+            {hiddenFromMemories ? "Show in memories" : "Hide from memories"}
+          </button>
           <button class="danger" onclick={notAPerson} disabled={actionBusy}>Not a person</button>
         {/if}
       {/snippet}
@@ -439,6 +463,7 @@
           onConfirm={confirmFace}
           onReject={rejectFace}
           onReassign={reassignFace}
+          onIgnore={ignoreFace}
           busy={verifyBusy}
         />
       {/each}

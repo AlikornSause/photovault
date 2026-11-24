@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use rusqlite::OptionalExtension;
-use smriti::db::face_repo::{FaceClusterRecord, FaceDetail, FaceRepo};
+use smriti::db::face_repo::{
+    FaceClusterRecord, FaceDetail, FaceRepo, FaceSnapshot, FaceState, MergeReceipt,
+};
 use smriti::db::{db_path_for, open_secondary};
 
 use crate::dto::{
@@ -337,12 +339,13 @@ pub struct FaceActionArgs {
 pub async fn people_face_confirm(
     state: State<'_, AppState>,
     args: FaceActionArgs,
-) -> CommandResult<()> {
+) -> CommandResult<String> {
     let lib_guard = state.library.read().await;
     let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
     let db = lib.db.lock().await;
-    FaceRepo::new(&db.conn).confirm_face(args.face_id)?;
-    Ok(())
+    undoable(&lib.drive_root, &db.conn, args.face_id, || {
+        Ok(FaceRepo::new(&db.conn).confirm_face(args.face_id)?)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,51 +358,53 @@ pub struct FaceConfirmToClusterArgs {
 pub async fn people_face_confirm_to_cluster(
     state: State<'_, AppState>,
     args: FaceConfirmToClusterArgs,
-) -> CommandResult<()> {
+) -> CommandResult<String> {
     let lib_guard = state.library.read().await;
     let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
     let db = lib.db.lock().await;
     ensure_face_cluster(&db.conn, args.cluster_id)?;
-    FaceRepo::new(&db.conn).confirm_face_to_cluster(args.face_id, args.cluster_id)?;
-    Ok(())
+    undoable(&lib.drive_root, &db.conn, args.face_id, || {
+        Ok(FaceRepo::new(&db.conn).confirm_face_to_cluster(args.face_id, args.cluster_id)?)
+    })
 }
 
 #[tauri::command]
 pub async fn people_face_reject(
     state: State<'_, AppState>,
     args: FaceActionArgs,
-) -> CommandResult<()> {
+) -> CommandResult<String> {
     let lib_guard = state.library.read().await;
     let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
     let db = lib.db.lock().await;
-
-    if let Some(cluster_id) = args.not_cluster_id {
-        ensure_face_cluster(&db.conn, cluster_id)?;
-        let current_cluster_id: Option<Option<i64>> = db
-            .conn
-            .query_row(
-                "SELECT cluster_id FROM faces WHERE id = ?1",
-                rusqlite::params![args.face_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match current_cluster_id {
-            Some(Some(current)) if current == cluster_id => {
-                FaceRepo::new(&db.conn).reject_face_to_unknown(args.face_id, cluster_id)?;
-            }
-            Some(_) => {
-                db.conn.execute(
+    undoable(&lib.drive_root, &db.conn, args.face_id, || {
+        if let Some(cluster_id) = args.not_cluster_id {
+            ensure_face_cluster(&db.conn, cluster_id)?;
+            let current_cluster_id: Option<Option<i64>> = db
+                .conn
+                .query_row(
+                    "SELECT cluster_id FROM faces WHERE id = ?1",
+                    rusqlite::params![args.face_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match current_cluster_id {
+                Some(Some(current)) if current == cluster_id => {
+                    FaceRepo::new(&db.conn).reject_face_to_unknown(args.face_id, cluster_id)?;
+                }
+                Some(_) => {
+                    db.conn.execute(
                     "INSERT OR IGNORE INTO face_negatives (face_id, not_cluster_id) VALUES (?1, ?2)",
                     rusqlite::params![args.face_id, cluster_id],
                 )?;
+                }
+                None => return Err(CommandError::not_found("face", args.face_id)),
             }
-            None => return Err(CommandError::not_found("face", args.face_id)),
+        } else {
+            let cluster_id = current_face_cluster_id(&db.conn, args.face_id)?;
+            FaceRepo::new(&db.conn).reject_face_to_unknown(args.face_id, cluster_id)?;
         }
-    } else {
-        let cluster_id = current_face_cluster_id(&db.conn, args.face_id)?;
-        FaceRepo::new(&db.conn).reject_face_to_unknown(args.face_id, cluster_id)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -412,20 +417,22 @@ pub struct FaceReassignArgs {
 pub async fn people_face_reassign(
     state: State<'_, AppState>,
     args: FaceReassignArgs,
-) -> CommandResult<()> {
+) -> CommandResult<String> {
     let lib_guard = state.library.read().await;
     let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
     let db = lib.db.lock().await;
 
     ensure_face_cluster(&db.conn, args.target_cluster_id)?;
     let old_cluster_id = current_face_cluster_id(&db.conn, args.face_id)?;
-    let repo = FaceRepo::new(&db.conn);
-    if old_cluster_id == args.target_cluster_id {
-        repo.confirm_face(args.face_id)?;
-    } else {
-        repo.reassign_face(args.face_id, args.target_cluster_id, old_cluster_id)?;
-    }
-    Ok(())
+    undoable(&lib.drive_root, &db.conn, args.face_id, || {
+        let repo = FaceRepo::new(&db.conn);
+        if old_cluster_id == args.target_cluster_id {
+            repo.confirm_face(args.face_id)?;
+        } else {
+            repo.reassign_face(args.face_id, args.target_cluster_id, old_cluster_id)?;
+        }
+        Ok(())
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,14 +542,29 @@ pub async fn people_k_similar_to_cluster(
                 .and_then(|c| c.name.clone());
         }
 
+        // Each face's photo, so the dialog can show where it's from.
+        let mut photo_of = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT photo_id FROM faces WHERE id = ?1")?;
+            for (face_id, _) in &scored {
+                if let Some(photo_id) = stmt
+                    .query_row([face_id], |row| row.get::<_, i64>(0))
+                    .optional()?
+                {
+                    photo_of.insert(*face_id, photo_id);
+                }
+            }
+        }
+
         Ok(scored
             .into_iter()
-            .map(|(face_id, _score)| {
+            .map(|(face_id, score)| {
+                // `confidence` carries how close the face is to this person.
                 let mut dto: FaceDetailDto = FaceDetail {
                     face_id,
-                    photo_id: 0,
+                    photo_id: photo_of.get(&face_id).copied().unwrap_or(0),
                     cluster_id: None,
-                    confidence: 0.0,
+                    confidence: score,
                     user_confirmed: 0,
                 }
                 .into();
@@ -706,11 +728,54 @@ pub struct PeopleMergeArgs {
     pub target_id: i64,
 }
 
+/// What [`people_unmerge`] needs to undo a merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeUndoDto {
+    pub source_id: i64,
+    pub target_id: i64,
+    pub source_name: Option<String>,
+    pub source_user_named: bool,
+    pub face_ids: Vec<i64>,
+    pub target_took_name: bool,
+}
+
+impl From<MergeReceipt> for MergeUndoDto {
+    fn from(r: MergeReceipt) -> Self {
+        Self {
+            source_id: r.source_id,
+            target_id: r.target_id,
+            source_name: r.source_name,
+            source_user_named: r.source_user_named,
+            face_ids: r.face_ids,
+            target_took_name: r.target_took_name,
+        }
+    }
+}
+
+impl From<MergeUndoDto> for MergeReceipt {
+    fn from(d: MergeUndoDto) -> Self {
+        Self {
+            source_id: d.source_id,
+            target_id: d.target_id,
+            source_name: d.source_name,
+            source_user_named: d.source_user_named,
+            face_ids: d.face_ids,
+            target_took_name: d.target_took_name,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeopleMergeResultDto {
+    pub person: PersonDto,
+    pub undo: MergeUndoDto,
+}
+
 #[tauri::command]
 pub async fn people_merge(
     state: State<'_, AppState>,
     args: PeopleMergeArgs,
-) -> CommandResult<PersonDto> {
+) -> CommandResult<PeopleMergeResultDto> {
     if args.source_id == args.target_id {
         return Err(CommandError::Conflict {
             reason: "source and target are the same cluster".into(),
@@ -721,7 +786,7 @@ pub async fn people_merge(
         let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
         (lib.db.clone(), lib.drive_root.clone())
     };
-    {
+    let receipt = {
         let db = db.lock().await;
         ensure_face_cluster(&db.conn, args.source_id)?;
         ensure_face_cluster(&db.conn, args.target_id)?;
@@ -730,14 +795,187 @@ pub async fn people_merge(
                 reason: "these people were previously marked as different".into(),
             });
         }
-        FaceRepo::new(&db.conn).merge_clusters(args.source_id, args.target_id)?;
-    }
+        FaceRepo::new(&db.conn)
+            .merge_clusters(args.source_id, args.target_id)?
+            .ok_or_else(|| CommandError::Conflict {
+                reason: "these people were previously marked as different".into(),
+            })?
+    };
     let clusters = load_clusters_with_thumbnail_paths(db, drive_root, Some(args.target_id)).await?;
     let cluster = clusters
         .into_iter()
         .find(|c| c.id == args.target_id)
         .ok_or_else(|| CommandError::not_found("person", args.target_id))?;
-    Ok(cluster.into())
+    Ok(PeopleMergeResultDto {
+        person: cluster.into(),
+        undo: receipt.into(),
+    })
+}
+
+/// Undo [`people_merge`]: the two become separate people again, for good.
+#[tauri::command]
+pub async fn people_unmerge(state: State<'_, AppState>, args: MergeUndoDto) -> CommandResult<()> {
+    let lib_guard = state.library.read().await;
+    let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
+    let db = lib.db.lock().await;
+    ensure_face_cluster(&db.conn, args.target_id)?;
+    FaceRepo::new(&db.conn).unmerge_clusters(&args.into())?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FaceIgnoreArgs {
+    pub face_id: i64,
+}
+
+/// "Not a face": the detection leaves its person and is never grouped again.
+#[tauri::command]
+pub async fn people_face_ignore(
+    state: State<'_, AppState>,
+    args: FaceIgnoreArgs,
+) -> CommandResult<String> {
+    let lib_guard = state.library.read().await;
+    let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
+    let db = lib.db.lock().await;
+    undoable(&lib.drive_root, &db.conn, args.face_id, || {
+        Ok(FaceRepo::new(&db.conn).ignore_face(args.face_id)?)
+    })
+}
+
+/// "Not sure" in face review: the face stops coming up for review.
+#[tauri::command]
+pub async fn people_face_skip(
+    state: State<'_, AppState>,
+    args: FaceIgnoreArgs,
+) -> CommandResult<String> {
+    let lib_guard = state.library.read().await;
+    let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
+    let db = lib.db.lock().await;
+    undoable(&lib.drive_root, &db.conn, args.face_id, || {
+        Ok(FaceRepo::new(&db.conn).skip_review_face(args.face_id)?)
+    })
+}
+
+// ---------- undo ----------
+
+/// A face decision that can be taken back while the app runs.
+struct FaceUndo {
+    token: String,
+    library: std::path::PathBuf,
+    before: FaceSnapshot,
+    after: Option<FaceState>,
+}
+
+/// Recent decisions, newest last. Undo is offered for seconds, so a short
+/// memory is plenty.
+static FACE_UNDO: std::sync::Mutex<Vec<FaceUndo>> = std::sync::Mutex::new(Vec::new());
+const FACE_UNDO_KEPT: usize = 50;
+
+/// Make a decision about one face and keep what taking it back needs.
+/// Returns the token [`people_face_undo`] takes.
+fn undoable(
+    library: &std::path::Path,
+    conn: &rusqlite::Connection,
+    face_id: i64,
+    decide: impl FnOnce() -> CommandResult<()>,
+) -> CommandResult<String> {
+    let repo = FaceRepo::new(conn);
+    let before = repo
+        .snapshot_face(face_id)
+        .optional()?
+        .ok_or_else(|| CommandError::not_found("face", face_id))?;
+    decide()?;
+    let after = repo.face_state(face_id)?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = format!(
+        "face-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut kept = FACE_UNDO.lock().unwrap_or_else(|e| e.into_inner());
+    kept.push(FaceUndo {
+        token: token.clone(),
+        library: library.to_path_buf(),
+        before,
+        after,
+    });
+    let excess = kept.len().saturating_sub(FACE_UNDO_KEPT);
+    kept.drain(..excess);
+    Ok(token)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FaceUndoArgs {
+    pub token: String,
+}
+
+/// Take back a face decision, if nothing has changed the face since.
+#[tauri::command]
+pub async fn people_face_undo(state: State<'_, AppState>, args: FaceUndoArgs) -> CommandResult<()> {
+    let lib_guard = state.library.read().await;
+    let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
+    let db = lib.db.lock().await;
+    let undo = {
+        let mut kept = FACE_UNDO.lock().unwrap_or_else(|e| e.into_inner());
+        let at = kept
+            .iter()
+            .position(|u| u.token == args.token && u.library == lib.drive_root)
+            .ok_or_else(|| CommandError::Conflict {
+                reason: "that can no longer be undone".into(),
+            })?;
+        kept.remove(at)
+    };
+    let repo = FaceRepo::new(&db.conn);
+    if repo.face_state(undo.before.face_id)? != undo.after {
+        return Err(CommandError::Conflict {
+            reason: "that face has changed since, so nothing was undone".into(),
+        });
+    }
+    repo.restore_face(&undo.before)?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PeopleMemoriesHiddenArgs {
+    pub id: i64,
+    pub hidden: Option<bool>,
+}
+
+/// Whether a person is kept out of Memories and collage suggestions. With
+/// `hidden` set, changes it first.
+#[tauri::command]
+pub async fn people_memories_hidden(
+    state: State<'_, AppState>,
+    args: PeopleMemoriesHiddenArgs,
+) -> CommandResult<bool> {
+    let lib_guard = state.library.read().await;
+    let lib = lib_guard.as_ref().ok_or(CommandError::LibraryClosed)?;
+    let db = lib.db.lock().await;
+    ensure_face_cluster(&db.conn, args.id)?;
+    let key = args.id.to_string();
+    match args.hidden {
+        Some(true) => {
+            db.conn.execute(
+                "INSERT OR IGNORE INTO memory_blocks (kind, target_key) VALUES ('person', ?1)",
+                [&key],
+            )?;
+        }
+        Some(false) => {
+            db.conn.execute(
+                "DELETE FROM memory_blocks WHERE kind = 'person' AND target_key = ?1",
+                [&key],
+            )?;
+        }
+        None => {}
+    }
+    Ok(db
+        .conn
+        .query_row(
+            "SELECT 1 FROM memory_blocks WHERE kind = 'person' AND target_key = ?1",
+            [&key],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 #[derive(Debug, Deserialize)]

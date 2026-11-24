@@ -9,6 +9,8 @@
   import Check from "lucide-svelte/icons/check";
   import X from "lucide-svelte/icons/x";
   import SkipForward from "lucide-svelte/icons/skip-forward";
+  import EyeOff from "lucide-svelte/icons/eye-off";
+  import Undo2 from "lucide-svelte/icons/undo-2";
 
   let stats = $state<ReviewFaceCountDto | null>(null);
   let faces = $state<FaceDetailDto[]>([]);
@@ -21,6 +23,9 @@
   let mounted = true;
   let loadSeq = 0;
   let skippedFaceIds = $state(new Set<number>());
+  type Answer = "confirm" | "reject" | "skip" | "ignore";
+  /// The last answer, so a misclick can be taken back (U or Ctrl+Z).
+  let last = $state<{ token: string; item: FaceDetailDto; kind: Answer } | null>(null);
 
   const current = $derived(faces[cursor] ?? null);
   const remaining = $derived(Math.max(0, faces.length - cursor));
@@ -58,24 +63,31 @@
     }
   }
 
-  async function answer(kind: "confirm" | "reject" | "skip") {
+  async function answer(kind: Answer) {
     if (!current || busy) return;
     busy = true;
     const item = current;
     try {
+      let token: string;
       if (kind === "confirm") {
-        await people.faceConfirm(item.face_id);
+        token = await people.faceConfirm(item.face_id);
         if (!mounted) return;
         confirmed += 1;
       } else if (kind === "reject") {
-        await people.faceReject(item.face_id);
+        token = await people.faceReject(item.face_id);
+        if (!mounted) return;
+        rejected += 1;
+      } else if (kind === "ignore") {
+        token = await people.faceIgnore(item.face_id);
         if (!mounted) return;
         rejected += 1;
       } else {
+        token = await people.faceSkip(item.face_id);
         if (!mounted) return;
         skippedFaceIds.add(item.face_id);
         skipped += 1;
       }
+      last = { token, item, kind };
       // Remove current from list
       faces.splice(cursor, 1);
       // If the list is empty, move to next cluster
@@ -89,8 +101,35 @@
     }
   }
 
+  /// Take back the last answer: the face comes back up next.
+  async function undoLast() {
+    const answered = last;
+    if (!answered || busy) return;
+    busy = true;
+    try {
+      await people.faceUndo(answered.token);
+      if (!mounted) return;
+      last = null;
+      if (answered.kind === "confirm") confirmed -= 1;
+      else if (answered.kind === "skip") {
+        skipped -= 1;
+        skippedFaceIds.delete(answered.item.face_id);
+      } else rejected -= 1;
+      faces.splice(cursor, 0, answered.item);
+    } catch (e) {
+      if (mounted) error = commandErrorMessage(e);
+    } finally {
+      if (mounted) busy = false;
+    }
+  }
+
   function onKey(e: KeyboardEvent) {
     if (ignoreShortcut(e)) return;
+    if (e.key === "u" || e.key === "U" || ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z"))) {
+      e.preventDefault();
+      void undoLast();
+      return;
+    }
     if (busy || !current) {
       if (e.key === "Escape" || e.key === "q" || e.key === "Q") {
         e.preventDefault();
@@ -107,6 +146,9 @@
     } else if (e.key === "s" || e.key === "S") {
       e.preventDefault();
       answer("skip");
+    } else if (e.key === "f" || e.key === "F") {
+      e.preventDefault();
+      answer("ignore");
     } else if (e.key === "Escape" || e.key === "q" || e.key === "Q") {
       e.preventDefault();
       window.location.hash = "/people";
@@ -130,13 +172,13 @@
   {/snippet}
   {#snippet subtitle()}
     <span class="hint">
-      Confirm or reject unconfirmed faces within each person cluster.
-      Y = confirm, N = reject, S = skip, Esc = close.
+      Is this the same person?
+      Y = yes, N = no, F = not a face, S = not sure, U = undo, Esc = close.
     </span>
   {/snippet}
   {#snippet actions()}
     <span class="counts mono">
-      {confirmed} confirmed · {rejected} rejected · {skipped} skipped
+      {confirmed} yes · {rejected} no · {skipped} skipped
     </span>
   {/snippet}
 </DetailHeader>
@@ -147,9 +189,9 @@
   {#if !current && faces.length === 0}
     <div class="empty">
       {#if (stats?.unconfirmed_total ?? 0) > 0 && skippedFaceIds.size > 0}
-        <p class="done">All caught up for this session — skipped faces will stay available for a later pass.</p>
+        <p class="done">All done. Faces you skipped won't come back.</p>
       {:else}
-        <p class="done">All caught up — no unconfirmed faces left to review.</p>
+        <p class="done">All done. Nothing left to check.</p>
       {/if}
     </div>
   {:else if !current}
@@ -167,7 +209,7 @@
       <div class="cluster-info">
         <span class="cluster-name">{c.cluster_name ?? "Unnamed"}</span>
         <span class="confidence mono">
-          {(c.confidence * 100).toFixed(0)}% confidence
+          Looks like them · {(c.confidence * 100).toFixed(0)}%
         </span>
       </div>
     </div>
@@ -184,12 +226,21 @@
       </button>
       <button
         class="action skip"
+        onclick={() => answer("ignore")}
+        disabled={busy}
+        title="Not a face (F)"
+      >
+        <EyeOff size={16} strokeWidth={2} />
+        <span>Not a face</span>
+      </button>
+      <button
+        class="action skip"
         onclick={() => answer("skip")}
         disabled={busy}
-        title="Skip (S)"
+        title="Not sure (S)"
       >
         <SkipForward size={16} strokeWidth={2} />
-        <span>Skip</span>
+        <span>Not sure</span>
       </button>
       <button
         class="action yes"
@@ -205,6 +256,12 @@
     <div class="progress">
       <span class="mono small muted">{remaining} more to review in this cluster</span>
     </div>
+  {/if}
+  {#if last}
+    <button class="undo" onclick={undoLast} disabled={busy} title="Undo (U)">
+      <Undo2 size={14} strokeWidth={2} />
+      <span>Undo</span>
+    </button>
   {/if}
 </div>
 
@@ -284,6 +341,26 @@
     color: var(--ink-muted);
   }
 
+  .undo {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: var(--s-4);
+    padding: 6px 12px;
+    border: 0;
+    border-radius: var(--r-pill, 999px);
+    background: transparent;
+    color: var(--ink-muted);
+    font-size: var(--t-sm);
+    animation: undo-in var(--t-base-d, 200ms) var(--ease) both;
+    transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+  }
+  .undo:hover, .undo:focus-visible {
+    color: var(--ink);
+    background: var(--bg-card);
+  }
+  @keyframes undo-in { from { opacity: 0; transform: translateY(-2px); } }
+  @media (prefers-reduced-motion: reduce) { .undo { animation: none; } }
   .actions-row {
     display: flex;
     gap: var(--s-3);

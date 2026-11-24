@@ -22,6 +22,16 @@ const mutate = async <T>(request: Promise<T>): Promise<T> => {
 };
 
 // ---------- people ----------
+/** What `people.unmerge` needs to undo a merge. */
+export interface MergeUndo {
+  source_id: number;
+  target_id: number;
+  source_name: string | null;
+  source_user_named: boolean;
+  face_ids: number[];
+  target_took_name: boolean;
+}
+
 export const people = {
   list: (args: { namedOnly?: boolean; minPhotos?: number } = {}) =>
     call<PersonDto[]>("people_list", {
@@ -33,12 +43,17 @@ export const people = {
   rename: (id: number, name: string | null) =>
     mutate(call<PersonDto>("people_rename", { id, name })),
   merge: (sourceId: number, targetId: number) =>
-    mutate(call<PersonDto>("people_merge", {
+    mutate(call<{ person: PersonDto; undo: MergeUndo }>("people_merge", {
       source_id: sourceId,
       target_id: targetId,
     })),
-  /// Delete a cluster — "not a real person." Faces become unclustered.
+  /// Undo a merge; the two are then never merged again.
+  unmerge: (undo: MergeUndo) => mutate(call<null>("people_unmerge", undo)),
+  /// Delete a cluster — "not a real person." Its faces are never regrouped.
   delete: (id: number) => mutate(call<null>("people_delete", { id })),
+  /// Whether this person is kept out of Memories; pass `hidden` to change it.
+  memoriesHidden: (id: number, hidden?: boolean) =>
+    mutate(call<boolean>("people_memories_hidden", { id, hidden: hidden ?? null })),
   startProcessing: (librarySessionId?: number) => call<JobIdDto>("people_start_processing", { library_session_id: librarySessionId }),
   resetAll: () =>
     mutate(call<{
@@ -79,23 +94,31 @@ export const people = {
       cursor: cursor ?? null,
       limit: limit ?? 24,
     }),
+  // Face decisions return a token `faceUndo` takes back within the session.
   faceConfirm: (faceId: number) =>
-    mutate(call<null>("people_face_confirm", { face_id: faceId })),
+    mutate(call<string>("people_face_confirm", { face_id: faceId })),
   faceConfirmToCluster: (faceId: number, clusterId: number) =>
-    mutate(call<null>("people_face_confirm_to_cluster", {
+    mutate(call<string>("people_face_confirm_to_cluster", {
       face_id: faceId,
       cluster_id: clusterId,
     })),
+  /// "Not a face": the detection is set aside for good.
+  faceIgnore: (faceId: number) =>
+    mutate(call<string>("people_face_ignore", { face_id: faceId })),
+  /// "Not sure" in review: the face stops coming up.
+  faceSkip: (faceId: number) => call<string>("people_face_skip", { face_id: faceId }),
   faceReject: (faceId: number, notClusterId?: number) =>
-    mutate(call<null>("people_face_reject", {
+    mutate(call<string>("people_face_reject", {
       face_id: faceId,
       not_cluster_id: notClusterId ?? null,
     })),
   faceReassign: (faceId: number, targetClusterId: number) =>
-    mutate(call<null>("people_face_reassign", {
+    mutate(call<string>("people_face_reassign", {
       face_id: faceId,
       target_cluster_id: targetClusterId,
     })),
+  /// Take back a face decision; refused if the face changed since.
+  faceUndo: (token: string) => mutate(call<null>("people_face_undo", { token })),
   faceSuggestClusters: (faceId: number, topK?: number) =>
     call<ClusterSuggestionDto[]>("people_face_suggest_clusters", {
       face_id: faceId,
@@ -288,6 +311,11 @@ export interface SearchResults {
 export const search = {
   query: (q: string, offset = 0, limit = 200) =>
     call<SearchResults>("search_query", { q, offset, limit }),
+  /// Remember a search the user settled on (Enter, or opening a result).
+  remember: (q: string) => call<null>("search_remember", { q }),
+  /// The latest remembered searches, newest first.
+  recent: () => call<string[]>("search_recent"),
+  clearRecent: () => call<null>("search_recent_clear"),
 };
 
 // ---------- semantic search ----------
@@ -330,6 +358,9 @@ export const memories = {
       memory_id: memoryId,
       name: name ?? null,
     }),
+  /** Hide a memory for good; returns the key `unhide` takes. */
+  hide: (memoryId: string) => call<string>("memories_hide", { memory_id: memoryId }),
+  unhide: (hideKey: string) => call<void>("memories_unhide", { hide_key: hideKey }),
 };
 
 // ---------- duplicates ----------
